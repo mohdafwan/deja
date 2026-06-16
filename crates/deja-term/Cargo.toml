@@ -1,0 +1,28 @@
+[package]
+name = "deja-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+description = "Déjà — GUI terminal (egui) jo 'kal chala aaj nahi' diff dikhata hai"
+
+[package.metadata.wix]
+upgrade-guid = "8EF9452D-36A2-47F8-94B1-16312830864D"
+path-guid = "14CC720E-C177-4A1C-A89B-41E6E313787D"
+license = false
+eula = false
+
+[[bin]]
+name = "deja-term"
+path = "src/main.rs"
+
+[dependencies]
+deja-core = { path = "../deja-core" }
+anyhow = "1"
+eframe = "0.34.3"
+egui = "0.34.3"
+portable-pty = "0.9.0"
+vte = "0.15.0"
+base64 = "0.22.1"
