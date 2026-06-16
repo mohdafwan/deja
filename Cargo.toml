@@ -7,12 +7,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/af3an/deja"
-authors = ["af3an"]
-homepage = "https://github.com/af3an/deja"
+repository = "https://github.com/mohdafwan/deja"
+authors = ["mohdafwan"]
+homepage = "https://github.com/mohdafwan/deja"
 
 # Config for 'dist'
 [workspace.metadata.dist]

@@ -62,7 +62,7 @@
         Id='*'
         Name='deja-term'
         UpgradeCode='8EF9452D-36A2-47F8-94B1-16312830864D'
-        Manufacturer='af3an'
+        Manufacturer='mohdafwan'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
@@ -70,7 +70,7 @@
         <Package Id='*'
             Keywords='Installer'
             Description='Déjà — GUI terminal (egui) jo &#39;kal chala aaj nahi&#39; diff dikhata hai'
-            Manufacturer='af3an'
+            Manufacturer='mohdafwan'
             InstallerVersion='450'
             Languages='1033'
             Compressed='yes'
@@ -173,7 +173,7 @@
         <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
         <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/af3an/deja'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/mohdafwan/deja'/>
         
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>
