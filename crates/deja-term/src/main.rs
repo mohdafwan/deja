@@ -39,42 +39,61 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// App icon RGBA (dark square + accent "«" rewind/Déjà feel). Koi asset file nahi.
-fn icon_rgba(s: usize) -> Vec<u8> {
-    let mut rgba = vec![0u8; s * s * 4];
-    let bg = [0x1eu8, 0x1e, 0x1e, 0xff];
-    let fg = [0xffu8, 0xcc, 0x66, 0xff];
-    let sf = s as f32;
-    let thick = sf * 0.08;
-    let centers = [0.40f32, 0.62];
-    for y in 0..s {
-        for x in 0..s {
-            let (px, py) = (x as f32, y as f32);
-            let mut on = false;
-            for &cxf in &centers {
-                let cx = cxf * sf;
-                let cy = 0.5 * sf;
-                let w = 0.12 * sf;
-                let h = 0.18 * sf;
-                let d1 = seg_dist(px, py, cx + w, cy - h, cx - w, cy);
-                let d2 = seg_dist(px, py, cx - w, cy, cx + w, cy + h);
-                if d1 < thick || d2 < thick {
-                    on = true;
-                }
+/// Brand logo (Δé) — binary me embed.
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
+
+/// PNG bytes → RGBA8 + dimensions (png crate se decode).
+fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width, info.height);
+    let src = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => src.to_vec(),
+        png::ColorType::Rgb => {
+            let mut o = Vec::with_capacity((w * h * 4) as usize);
+            for p in src.chunks_exact(3) {
+                o.extend_from_slice(&[p[0], p[1], p[2], 255]);
             }
-            let i = (y * s + x) * 4;
-            rgba[i..i + 4].copy_from_slice(if on { &fg } else { &bg });
+            o
         }
-    }
-    rgba
+        png::ColorType::GrayscaleAlpha => {
+            let mut o = Vec::new();
+            for p in src.chunks_exact(2) {
+                o.extend_from_slice(&[p[0], p[0], p[0], p[1]]);
+            }
+            o
+        }
+        png::ColorType::Grayscale => {
+            let mut o = Vec::new();
+            for &g in src {
+                o.extend_from_slice(&[g, g, g, 255]);
+            }
+            o
+        }
+        png::ColorType::Indexed => return None,
+    };
+    Some((rgba, w, h))
 }
 
+/// Window/taskbar icon — brand logo se.
 fn make_icon() -> egui::IconData {
-    let s = 64u32;
-    egui::IconData {
-        rgba: icon_rgba(s as usize),
-        width: s,
-        height: s,
+    if let Some((rgba, w, h)) = decode_png_rgba(LOGO_PNG) {
+        egui::IconData {
+            rgba,
+            width: w,
+            height: h,
+        }
+    } else {
+        // fallback: solid emerald square
+        egui::IconData {
+            rgba: vec![0x0c, 0x23, 0x1e, 0xff].repeat(64 * 64),
+            width: 64,
+            height: 64,
+        }
     }
 }
 
@@ -106,7 +125,7 @@ fn install_desktop_entry(force: bool) {
     }
     let _ = std::fs::create_dir_all(&icons_dir);
     let _ = std::fs::create_dir_all(&apps_dir);
-    write_icon_png(&icon, 256);
+    write_icon_png(&icon);
     let entry = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -141,15 +160,10 @@ fn uninstall_desktop_entry() {
     }
 }
 
+// desktop icon = brand logo PNG (jaisa hai waisa)
 #[cfg(target_os = "linux")]
-fn write_icon_png(path: &str, size: usize) {
-    let Ok(file) = std::fs::File::create(path) else { return };
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), size as u32, size as u32);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    if let Ok(mut w) = enc.write_header() {
-        let _ = w.write_image_data(&icon_rgba(size));
-    }
+fn write_icon_png(path: &str) {
+    let _ = std::fs::write(path, LOGO_PNG);
 }
 
 // non-Linux: no-ops (Windows/macOS desktop integration alag se)
@@ -157,19 +171,6 @@ fn write_icon_png(path: &str, size: usize) {
 fn install_desktop_entry(_force: bool) {}
 #[cfg(not(target_os = "linux"))]
 fn uninstall_desktop_entry() {}
-
-/// point se segment ki shortest distance.
-fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    let (dx, dy) = (bx - ax, by - ay);
-    let len2 = dx * dx + dy * dy;
-    let t = if len2 > 0.0 {
-        (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let (cx, cy) = (ax + t * dx, ay + t * dy);
-    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
-}
 
 /// Fail hui command ka diff jo block ke andar dikhta hai.
 struct DiffView {
