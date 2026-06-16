@@ -123,16 +123,16 @@ const ZSH_INTEGRATION: &str = r#"
 # Déjà GUI terminal shell integration (auto-injected)
 [ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc"
 
-__deja_preexec() { __DEJA_CMD="$1"; }
+__deja_b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+__deja_preexec() { __DEJA_CMD="$1"; printf '\033]133;C\007'; }
 __deja_precmd() {
   local ec=$?
   if [ -n "$__DEJA_CMD" ]; then
-    printf '\033]133;D;%s;%s;%s\007' "$ec" \
-      "$(printf '%s' "$__DEJA_CMD" | base64 | tr -d '\n')" \
-      "$(printf '%s' "$PWD" | base64 | tr -d '\n')"
+    printf '\033]133;D;%s;%s;%s\007' "$ec" "$(__deja_b64 "$__DEJA_CMD")" "$(__deja_b64 "$PWD")"
     __DEJA_CMD=""
   fi
-  printf '\033]133;A\007'
+  printf '\033]133;A;%s;%s\007' "$(__deja_b64 "$PWD")" \
+    "$(__deja_b64 "$(git branch --show-current 2>/dev/null)")"
 }
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec __deja_preexec
@@ -143,24 +143,25 @@ const BASH_INTEGRATION: &str = r#"
 # Déjà GUI terminal shell integration (auto-injected)
 if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
 
+__deja_b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 __deja_osc() {
   local ec=$?
-  # pehla prompt skip karo (tab tak koi command nahi chali — history file ka
-  # purana entry emit hone se bachao)
-  if [ -z "$__DEJA_READY" ]; then __DEJA_READY=1; return; fi
   local hnum cmd
   read -r hnum cmd <<< "$(HISTTIMEFORMAT='' history 1)"
-  if [ -n "$cmd" ] && [ "$hnum" != "$__DEJA_LAST" ]; then
+  # D = command complete (pehla prompt skip — koi command nahi chali abhi tak)
+  if [ -n "$__DEJA_READY" ] && [ -n "$cmd" ] && [ "$hnum" != "$__DEJA_LAST" ]; then
     __DEJA_LAST="$hnum"
-    printf '\033]133;D;%s;%s;%s\007' "$ec" \
-      "$(printf '%s' "$cmd" | base64 | tr -d '\n')" \
-      "$(printf '%s' "$PWD" | base64 | tr -d '\n')"
+    printf '\033]133;D;%s;%s;%s\007' "$ec" "$(__deja_b64 "$cmd")" "$(__deja_b64 "$PWD")"
   fi
+  __DEJA_READY=1
+  # A = naya block start, path + git branch ke saath
+  printf '\033]133;A;%s;%s\007' "$(__deja_b64 "$PWD")" \
+    "$(__deja_b64 "$(git branch --show-current 2>/dev/null)")"
 }
-# prompt-start marker (OSC 133 ; A) → Warp-style block boundary
-case "$PS1" in
-  *'133;A'*) ;;
-  *) PS1='\[\033]133;A\007\]'"$PS1" ;;
+# C = command execute hone se theek pehle (output start) — PS0 ANSI-C escapes
+case "$PS0" in
+  *'133;C'*) ;;
+  *) PS0=$'\e]133;C\a'"$PS0" ;;
 esac
 case ";${PROMPT_COMMAND};" in
   *";__deja_osc;"*) ;;

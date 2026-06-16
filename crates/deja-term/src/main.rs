@@ -13,7 +13,9 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 600.0])
             .with_title("Déjà")
-            .with_icon(make_icon()),
+            .with_icon(make_icon())
+            .with_decorations(false) // custom title bar (tabs + window buttons)
+            .with_resizable(true),
         ..Default::default()
     };
     eframe::run_native(
@@ -82,6 +84,79 @@ struct DiffView {
 /// Worker thread se aaya diff result.
 type DiffResult = (u64, i64, Vec<deja_core::diff::Change>);
 
+/// Theme = default bg + fg + accent colors. ANSI-colored cells waise hi rehte;
+/// sirf "default" (term::BG/term::FG sentinel) cells theme pe map hote hain.
+#[derive(Clone, Copy)]
+struct Theme {
+    name: &'static str,
+    bg: egui::Color32,     // window/card background
+    fg: egui::Color32,     // bright output text
+    muted: egui::Color32,  // metadata / borders
+    accent: egui::Color32, // cursor + git branch
+    path: egui::Color32,   // path text
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
+    egui::Color32::from_rgb(r, g, b)
+}
+
+const THEMES: [Theme; 4] = [
+    Theme {
+        name: "Emerald",
+        bg: rgb(0x0c, 0x23, 0x1e),
+        fg: rgb(0xe6, 0xf0, 0xec),
+        muted: rgb(0x6f, 0x8a, 0x83),
+        accent: rgb(0x34, 0xd3, 0x99),
+        path: rgb(0x8b, 0xd5, 0xc4),
+    },
+    Theme {
+        name: "Dark",
+        bg: rgb(0x1a, 0x1a, 0x1e),
+        fg: rgb(0xe0, 0xe0, 0xe0),
+        muted: rgb(0x80, 0x80, 0x88),
+        accent: rgb(0x6c, 0xb6, 0xff),
+        path: rgb(0xc8, 0xa8, 0xff),
+    },
+    Theme {
+        name: "Light",
+        bg: rgb(0xfa, 0xf8, 0xf2),
+        fg: rgb(0x24, 0x28, 0x2c),
+        muted: rgb(0x8a, 0x90, 0x96),
+        accent: rgb(0x0e, 0x9f, 0x6e),
+        path: rgb(0x2b, 0x6c, 0xb0),
+    },
+    Theme {
+        name: "Midnight",
+        bg: rgb(0x0d, 0x12, 0x1c),
+        fg: rgb(0xc8, 0xd3, 0xde),
+        muted: rgb(0x5e, 0x6b, 0x7e),
+        accent: rgb(0x6c, 0xb6, 0xff),
+        path: rgb(0x9d, 0xb8, 0xff),
+    },
+];
+
+/// Cell ka stored "default" color (term::FG/BG sentinel) ko active theme pe map karo.
+fn theme_fg(c: egui::Color32, theme: Theme) -> egui::Color32 {
+    if c == term::FG {
+        theme.fg
+    } else {
+        c
+    }
+}
+fn theme_bg(c: egui::Color32, theme: Theme) -> egui::Color32 {
+    if c == term::BG {
+        theme.bg
+    } else {
+        c
+    }
+}
+
+fn apply_theme(ctx: &egui::Context, theme: Theme) {
+    let mut style = (*ctx.global_style()).clone();
+    style.visuals.panel_fill = theme.bg;
+    ctx.set_global_style(style);
+}
+
 /// Ek terminal session (ek tab).
 struct Terminal {
     pty: pty::Pty,
@@ -91,11 +166,14 @@ struct Terminal {
     diffs: HashMap<u64, DiffView>,
     cmd_tx: Sender<term::CmdEvent>,
     diff_rx: Receiver<DiffResult>,
-    id: usize,
+    /// Bottom input field ka buffer (Warp-style line editor).
+    input: String,
+    /// Submit ki hui command jo abhi chal rahi (running card me dikhti, D pe clear).
+    running: Option<String>,
 }
 
 impl Terminal {
-    fn new(ctx: &egui::Context, id: usize) -> Self {
+    fn new(ctx: &egui::Context) -> Self {
         let (rows, cols) = (24u16, 80u16);
         let rctx = ctx.clone();
         let (pty, rx) =
@@ -115,7 +193,8 @@ impl Terminal {
             diffs: HashMap::new(),
             cmd_tx,
             diff_rx,
-            id,
+            input: String::new(),
+            running: None,
         }
     }
 
@@ -126,6 +205,9 @@ impl Terminal {
             self.parser.advance(&mut self.screen, &bytes);
         }
         let events: Vec<term::CmdEvent> = std::mem::take(&mut self.screen.events);
+        if !events.is_empty() {
+            self.running = None; // command complete → running card hata do
+        }
         for ev in events {
             let _ = self.cmd_tx.send(ev);
         }
@@ -153,7 +235,8 @@ impl Terminal {
             .to_string()
     }
 
-    fn handle_input(&mut self, ui: &egui::Ui) {
+    /// Alt-screen (vim/htop) me raw keys seedha PTY ko bhejo.
+    fn forward_raw(&mut self, ui: &egui::Ui) {
         let mut out: Vec<u8> = Vec::new();
         ui.input(|i| {
             for ev in &i.events {
@@ -204,8 +287,8 @@ impl Terminal {
 struct DejaApp {
     tabs: Vec<Terminal>,
     active: usize,
-    next_id: usize,
     font_size: f32,
+    theme_idx: usize,
 }
 
 impl DejaApp {
@@ -223,23 +306,24 @@ impl DejaApp {
         }
         cc.egui_ctx.set_fonts(fonts);
 
-        // dark background
-        let mut style = (*cc.egui_ctx.global_style()).clone();
-        style.visuals.panel_fill = term::BG;
-        cc.egui_ctx.set_global_style(style);
+        // default theme (Dark)
+        apply_theme(&cc.egui_ctx, THEMES[0]);
 
-        let first = Terminal::new(&cc.egui_ctx, 1);
+        let first = Terminal::new(&cc.egui_ctx);
         DejaApp {
             tabs: vec![first],
             active: 0,
-            next_id: 2,
             font_size: 14.0,
+            theme_idx: 0,
         }
     }
 
+    fn theme(&self) -> Theme {
+        THEMES[self.theme_idx % THEMES.len()]
+    }
+
     fn add_tab(&mut self, ctx: &egui::Context) {
-        let t = Terminal::new(ctx, self.next_id);
-        self.next_id += 1;
+        let t = Terminal::new(ctx);
         self.tabs.push(t);
         self.active = self.tabs.len() - 1;
     }
@@ -259,26 +343,162 @@ impl DejaApp {
         }
     }
 
-    /// Tab bar render karo + actions handle karo.
-    fn tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// Modern tab bar — rounded chips, active highlighted, theme button right.
+    fn tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, theme: Theme) {
         let mut activate: Option<usize> = None;
         let mut close: Option<usize> = None;
         let mut want_new = false;
+        let mut cycle = false;
+        let mut win_min = false;
+        let mut win_max = false;
+        let mut win_close = false;
+
+        // window drag + double-click maximize (background — buttons iske upar render hote)
+        let title_resp = ui.interact(
+            ui.max_rect(),
+            egui::Id::new("deja_titlebar_drag"),
+            egui::Sense::click_and_drag(),
+        );
+        if title_resp.double_clicked() {
+            win_max = true;
+        } else if title_resp.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0; // tabs flush (no gap)
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let h = 34.0; // fixed bar height — highlight pura cell fill kare
+            let plus_w = 30.0;
+            let n = self.tabs.len().max(1);
+            // right controls (theme + 3 window buttons) ke liye width reserve →
+            // tabs unpe overflow na karein. Bache hue space me tabs exact-fit
+            // (zyada tabs → shrink, Warp jaisa), max 200.
+            let avail_for_tabs = (ui.available_width() - 230.0 - plus_w).max(60.0);
+            let tab_w = (avail_for_tabs / n as f32).clamp(2.0, 200.0);
+            let tab_font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+
+            let x_w = 26.0;
             for (i, t) in self.tabs.iter().enumerate() {
-                let title = format!("{}: {}", t.id, t.title());
-                if ui.selectable_label(i == self.active, title).clicked() {
+                let selected = i == self.active;
+                // layout space reserve (geometry ke liye), click body/× alag interacts se
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(tab_w, h), egui::Sense::hover());
+                // geometric hover — widget hover-steal se bachne ke liye
+                let hovered = ui
+                    .input(|i| i.pointer.hover_pos())
+                    .map_or(false, |p| rect.contains(p));
+
+                // body (activate) — hover pe × area chhod do (overlap na ho)
+                let body_rect = if hovered {
+                    egui::Rect::from_min_max(
+                        rect.left_top(),
+                        egui::pos2(rect.right() - x_w, rect.bottom()),
+                    )
+                } else {
+                    rect
+                };
+                let body = ui.interact(body_rect, egui::Id::new(("deja_tab", i)), egui::Sense::click());
+
+                // flat bg (no border, no corner radius) — pura cell
+                let bg = if selected {
+                    theme.fg.gamma_multiply(0.13)
+                } else if hovered {
+                    theme.fg.gamma_multiply(0.05)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                // painter_at(rect) → bg + text cell me CLIP (narrow tab pe text overflow na ho)
+                let tp = ui.painter_at(rect);
+                tp.rect_filled(rect, 0.0, bg);
+                let col = if selected { theme.fg } else { theme.muted };
+                tp.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    t.title(),
+                    tab_font.clone(),
+                    col,
+                );
+
+                if body.clicked() {
                     activate = Some(i);
                 }
-                if ui.small_button("×").on_hover_text("close tab").clicked() {
+                if body.middle_clicked() {
                     close = Some(i);
                 }
-                ui.separator();
+
+                // close × sirf hover pe (right side) — non-overlapping interact
+                if hovered {
+                    let xr = egui::Rect::from_min_size(
+                        egui::pos2(rect.right() - x_w, rect.top()),
+                        egui::vec2(x_w, h),
+                    );
+                    let xresp =
+                        ui.interact(xr, egui::Id::new(("deja_tabx", i)), egui::Sense::click());
+                    if xresp.hovered() {
+                        ui.painter().rect_filled(
+                            xr.shrink2(egui::vec2(4.0, 8.0)),
+                            egui::CornerRadius::same(4),
+                            egui::Color32::from_white_alpha(30),
+                        );
+                    }
+                    let xcol = if xresp.hovered() {
+                        egui::Color32::WHITE
+                    } else {
+                        theme.muted
+                    };
+                    let cc = xr.center();
+                    let r = 4.5;
+                    let st = egui::Stroke::new(1.5, xcol);
+                    let p = ui.painter();
+                    p.line_segment([egui::pos2(cc.x - r, cc.y - r), egui::pos2(cc.x + r, cc.y + r)], st);
+                    p.line_segment([egui::pos2(cc.x - r, cc.y + r), egui::pos2(cc.x + r, cc.y - r)], st);
+                    if xresp.clicked() {
+                        close = Some(i);
+                    }
+                }
             }
-            if ui.button("+").on_hover_text("new tab (Ctrl+Shift+T)").clicked() {
+            // new tab — bada "+"
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("+").color(theme.fg).size(22.0))
+                        .min_size(egui::vec2(plus_w, h))
+                        .frame(false),
+                )
+                .on_hover_text("new tab (Ctrl+Shift+T)")
+                .clicked()
+            {
                 want_new = true;
             }
+            // right side: window controls + theme (right_to_left → rightmost pehle)
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if window_button(ui, theme, "close") {
+                    win_close = true;
+                }
+                if window_button(ui, theme, "max") {
+                    win_max = true;
+                }
+                if window_button(ui, theme, "min") {
+                    win_min = true;
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("🎨 {}", self.theme().name))
+                                .color(theme.muted)
+                                .size(12.0),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("theme badlo")
+                    .clicked()
+                {
+                    cycle = true;
+                }
+            });
         });
+
         if let Some(i) = activate {
             self.active = i;
         }
@@ -288,11 +508,26 @@ impl DejaApp {
         if want_new {
             self.add_tab(ctx);
         }
-        ui.separator();
+        if cycle {
+            self.theme_idx = (self.theme_idx + 1) % THEMES.len();
+            apply_theme(ctx, self.theme());
+        }
+        // window controls
+        if win_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if win_min {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if win_max {
+            let m = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!m));
+        }
     }
 }
 
 impl eframe::App for DejaApp {
+    #[allow(deprecated)] // egui::TopBottomPanel alias — kaam karta hai
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
@@ -338,48 +573,92 @@ impl eframe::App for DejaApp {
             t.pump();
         }
 
-        // tab bar
-        self.tab_bar(ui, &ctx);
-
-        // font cell size
+        let theme = self.theme();
         let font = egui::FontId::monospace(self.font_size);
         let galley = ui
             .painter()
-            .layout_no_wrap("M".to_string(), font.clone(), term::FG);
+            .layout_no_wrap("M".to_string(), font.clone(), theme.fg);
         let char_w = galley.size().x.max(1.0);
         let row_h = galley.size().y.max(1.0);
-        let avail = ui.available_size();
-        let cols = ((avail.x / char_w).floor() as usize).max(20);
-        let rows = ((avail.y / row_h).floor() as usize).max(5);
-
-        // active terminal: resize + input + render
         let active = self.active;
-        if let Some(t) = self.tabs.get_mut(active) {
-            t.resize_to(rows, cols);
-            t.handle_input(ui);
-            t.render_blocks(ui, &font);
+        let alt = self.tabs.get(active).map_or(false, |t| t.screen.alt_active);
+
+        // Ctrl+C / Ctrl+D (non-alt) → seedha PTY (interrupt / EOF)
+        if !alt {
+            let (cc, cd) = ui.input(|i| {
+                (
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::C),
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::D),
+                )
+            });
+            if let Some(t) = self.tabs.get_mut(active) {
+                if cc {
+                    t.input.clear();
+                    t.pty.write(&[0x03]);
+                }
+                if cd && t.input.is_empty() {
+                    t.pty.write(&[0x04]);
+                }
+            }
         }
+
+        // TOP — tab bar
+        egui::TopBottomPanel::top("deja_tabs")
+            .frame(egui::Frame::default().fill(theme.bg)) // no margin → tabs edge-to-edge
+            .show_inside(ui, |ui| self.tab_bar(ui, &ctx, theme));
+
+        // BOTTOM — fixed input field (Warp style). Alt-screen apps me chhupa do.
+        if !alt {
+            egui::TopBottomPanel::bottom("deja_input")
+                .frame(
+                    egui::Frame::default()
+                        .fill(theme.bg)
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(14)))
+                        .inner_margin(egui::Margin::symmetric(16, 10)),
+                )
+                .show_inside(ui, |ui| {
+                    if let Some(t) = self.tabs.get_mut(active) {
+                        t.render_input(ui, &font, theme);
+                    }
+                });
+        }
+
+        // CENTER — command history (scrolls). Alt-screen apps yahi poora grid use karte.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(theme.bg))
+            .show_inside(ui, |ui| {
+                let avail = ui.available_size();
+                let cols = ((avail.x / char_w).floor() as usize).max(20);
+                let rows = ((avail.y / row_h).floor() as usize).max(5);
+                if let Some(t) = self.tabs.get_mut(active) {
+                    t.resize_to(rows, cols);
+                    if t.screen.alt_active {
+                        t.forward_raw(ui); // vim/htop ke raw keys
+                    }
+                    t.render_history(ui, &font, theme);
+                }
+            });
     }
 }
 
 impl Terminal {
-    /// Output ko OSC-133 boundaries ke hisaab se blocks me render karo.
-    fn render_blocks(&self, ui: &mut egui::Ui, font: &egui::FontId) {
-        // alt-screen (vim/htop) → poora grid, blocks nahi
-        if self.screen.alt_active {
-            render_alt(ui, font, &self.screen);
-            return;
-        }
+    fn line_at<'a>(&'a self, g: usize) -> &'a [term::Cell] {
         let sb = self.screen.scrollback.len();
-        let total = sb + self.screen.grid.len();
-        let cursor_global = sb + self.screen.cy;
-        let b = &self.screen.boundaries;
+        if g < sb {
+            &self.screen.scrollback[g]
+        } else {
+            &self.screen.grid[g - sb]
+        }
+    }
 
-        // segments banao: (start, end, boundary_index?)
-        let mut segs: Vec<(usize, usize, Option<usize>)> = Vec::new();
+    /// Sab segments (start, end, boundary_index?). Aakhri segment = active prompt.
+    fn segments(&self) -> Vec<(usize, usize, Option<usize>)> {
+        let total = self.screen.scrollback.len() + self.screen.grid.len();
+        let b = &self.screen.boundaries;
+        let mut segs = Vec::new();
         let first = b.first().map(|x| x.start.min(total)).unwrap_or(total);
         if first > 0 {
-            segs.push((0, first, None)); // pehle prompt se pehle ka output
+            segs.push((0, first, None));
         }
         for i in 0..b.len() {
             let start = b[i].start.min(total);
@@ -390,51 +669,282 @@ impl Terminal {
             };
             segs.push((start, end, Some(i)));
         }
+        segs
+    }
 
-        let get = |g: usize| -> &[term::Cell] {
-            if g < sb {
-                &self.screen.scrollback[g]
-            } else {
-                &self.screen.grid[g - sb]
-            }
-        };
-
+    /// Command history (central, scrolls). Top-down, clean. stick_to_bottom se
+    /// newest hamesha visible rehta jab content overflow ho.
+    fn render_history(&self, ui: &mut egui::Ui, font: &egui::FontId, theme: Theme) {
+        // alt-screen (vim/htop) → poora grid central me
+        if self.screen.alt_active {
+            render_alt(ui, font, &self.screen, theme);
+            return;
+        }
+        let segs = self.segments();
+        let last = segs.len().saturating_sub(1);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                for (start, end, bidx) in segs {
+                // bada top spacer + stick_to_bottom = content bottom pe chipakti
+                // (Warp jaisa: kam commands neeche, upar khaali). No flicker.
+                ui.add_space(ui.available_height());
+                for (idx, seg) in segs.iter().enumerate() {
+                    let (start, end, bidx) = *seg;
+                    let boundary = bidx.map(|i| &self.screen.boundaries[i]);
+
+                    if idx == last {
+                        // active: command chal rahi → running card, warna idle
+                        // prompt bottom input bar me hai → skip
+                        if let (Some(cmd), Some(b)) = (&self.running, boundary) {
+                            let ostart = b.output_start.clamp(start, end);
+                            let mut out: Vec<&[term::Cell]> =
+                                (ostart..end).map(|g| self.line_at(g)).collect();
+                            trim_trailing_blank(&mut out, None);
+                            render_card(ui, font, b, Some(cmd), &out, theme, &self.diffs);
+                            ui.add_space(8.0);
+                        }
+                        continue;
+                    }
+
                     if start >= end && bidx.is_none() {
                         continue;
                     }
-                    let cursor_in = if cursor_global >= start && cursor_global < end {
-                        Some((cursor_global - start, self.screen.cx))
+                    if boundary.map_or(false, |b| b.exit.is_some()) {
+                        let b = boundary.unwrap();
+                        let ostart = b.output_start.clamp(start, end);
+                        let mut out: Vec<&[term::Cell]> =
+                            (ostart..end).map(|g| self.line_at(g)).collect();
+                        trim_trailing_blank(&mut out, None);
+                        render_card(ui, font, b, b.command.as_deref(), &out, theme, &self.diffs);
                     } else {
-                        None
-                    };
-
-                    let mut lines: Vec<&[term::Cell]> = (start..end).map(get).collect();
-                    // trailing blank lines trim karo (cursor line chhod ke)
-                    while let Some(last) = lines.last() {
-                        let idx = lines.len() - 1;
-                        let blank = last.iter().all(|c| c.ch == ' ');
-                        let is_cursor = cursor_in.map(|(l, _)| l) == Some(idx);
-                        if blank && !is_cursor {
-                            lines.pop();
-                        } else {
-                            break;
-                        }
+                        let mut raw: Vec<&[term::Cell]> =
+                            (start..end).map(|g| self.line_at(g)).collect();
+                        trim_trailing_blank(&mut raw, None);
+                        render_raw(ui, font, boundary, &raw, None, theme);
                     }
-
-                    let header = bidx.map(|i| &self.screen.boundaries[i]);
-                    render_one_block(ui, font, &lines, header, cursor_in, &self.diffs);
+                    ui.add_space(8.0);
                 }
             });
     }
+
+    /// Active boundary ka cwd (input chip ke liye).
+    fn active_cwd(&self) -> Option<String> {
+        self.screen
+            .boundaries
+            .last()
+            .and_then(|b| b.cwd.as_deref())
+            .map(short_path)
+    }
+
+    /// Fixed bottom input field (Warp-style line editor). Enter pe command submit.
+    fn render_input(&mut self, ui: &mut egui::Ui, font: &egui::FontId, theme: Theme) {
+        if self.screen.alt_active {
+            return;
+        }
+        let big = egui::FontId::monospace(font.size + 2.0);
+        ui.horizontal(|ui| {
+            // path chip (folder)
+            let chip = self.active_cwd().unwrap_or_else(|| "~".to_string());
+            egui::Frame::default()
+                .fill(theme.accent.gamma_multiply(0.14))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(7, 3))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    // folder icon (manually drawn)
+                    let (ir, _) =
+                        ui.allocate_exact_size(egui::vec2(13.0, 14.0), egui::Sense::hover());
+                    folder_icon(&ui.painter_at(ir), ir.center(), theme.path);
+                    ui.label(egui::RichText::new(chip).color(theme.path).size(12.0));
+                });
+
+            // input field
+            let te = egui::TextEdit::singleline(&mut self.input)
+                .frame(egui::Frame::default())
+                .font(big.clone())
+                .text_color(theme.fg)
+                .hint_text(egui::RichText::new("type a command…").color(theme.muted))
+                .desired_width(f32::INFINITY);
+            let resp = ui.add(te);
+
+            // hamesha focused rakho (terminal feel)
+            if !resp.has_focus() {
+                resp.request_focus();
+            }
+            // Enter → submit (input field hamesha focused hai)
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let line = std::mem::take(&mut self.input);
+                self.pty.write(line.as_bytes());
+                self.pty.write(b"\n");
+                if !line.is_empty() {
+                    self.running = Some(line);
+                }
+                resp.request_focus();
+            }
+        });
+    }
+}
+
+/// Trailing all-blank lines hatao (cursor line chhod ke).
+fn trim_trailing_blank(lines: &mut Vec<&[term::Cell]>, keep: Option<usize>) {
+    while let Some(last) = lines.last() {
+        let idx = lines.len() - 1;
+        let blank = last.iter().all(|c| c.ch == ' ');
+        if blank && keep != Some(idx) {
+            lines.pop();
+        } else {
+            break;
+        }
+    }
+}
+
+const C_BLUE: egui::Color32 = rgb(0x4a, 0xa3, 0xff);
+
+/// $HOME ko ~ se chhota karo.
+fn short_path(cwd: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if cwd == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = cwd.strip_prefix(&format!("{home}/")) {
+            return format!("~/{rest}");
+        }
+    }
+    cwd.to_string()
+}
+
+/// Window control button — icon manually draw (font glyphs pe depend nahi).
+/// kind: "min" | "max" | "close". Returns clicked.
+fn window_button(ui: &mut egui::Ui, theme: Theme, kind: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 24.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        let bg = if kind == "close" {
+            C_RED
+        } else {
+            egui::Color32::from_white_alpha(30)
+        };
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(5), bg);
+    }
+    let col = if hovered {
+        egui::Color32::WHITE
+    } else {
+        theme.fg.gamma_multiply(0.75)
+    };
+    let stroke = egui::Stroke::new(1.4, col);
+    let c = rect.center();
+    let r = 5.0;
+    let p = ui.painter();
+    match kind {
+        "min" => {
+            p.line_segment([egui::pos2(c.x - r, c.y), egui::pos2(c.x + r, c.y)], stroke);
+        }
+        "max" => {
+            let sq = egui::Rect::from_center_size(c, egui::vec2(2.0 * r, 2.0 * r));
+            p.line_segment([sq.left_top(), sq.right_top()], stroke);
+            p.line_segment([sq.right_top(), sq.right_bottom()], stroke);
+            p.line_segment([sq.right_bottom(), sq.left_bottom()], stroke);
+            p.line_segment([sq.left_bottom(), sq.left_top()], stroke);
+        }
+        "close" => {
+            p.line_segment([egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)], stroke);
+            p.line_segment([egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)], stroke);
+        }
+        _ => {}
+    }
+    resp.clicked()
+}
+
+/// Rect ka outline 4 lines se (rect_stroke API se bachne ke liye).
+fn stroke_rect(p: &egui::Painter, r: egui::Rect, s: egui::Stroke) {
+    p.line_segment([r.left_top(), r.right_top()], s);
+    p.line_segment([r.right_top(), r.right_bottom()], s);
+    p.line_segment([r.right_bottom(), r.left_bottom()], s);
+    p.line_segment([r.left_bottom(), r.left_top()], s);
+}
+
+/// Copy icon button — do overlapping rects (clipboard). Returns clicked.
+fn copy_button(ui: &mut egui::Ui, theme: Theme) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 18.0), egui::Sense::click());
+    let resp = resp.on_hover_text("copy output");
+    let col = if resp.hovered() { theme.fg } else { theme.muted };
+    let st = egui::Stroke::new(1.2, col);
+    let c = rect.center();
+    let p = ui.painter();
+    let back = egui::Rect::from_min_size(egui::pos2(c.x - 1.0, c.y - 5.0), egui::vec2(7.0, 7.0));
+    let front = egui::Rect::from_min_size(egui::pos2(c.x - 5.0, c.y - 1.0), egui::vec2(7.0, 7.0));
+    stroke_rect(&p, back, st);
+    p.rect_filled(front, egui::CornerRadius::same(1), theme.bg); // back ko mask
+    stroke_rect(&p, front, st);
+    resp.clicked()
+}
+
+/// Folder icon (filled silhouette) — input chip ke liye.
+fn folder_icon(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
+    let w = 11.0;
+    let body = egui::Rect::from_min_size(
+        egui::pos2(c.x - w / 2.0, c.y - 3.0),
+        egui::vec2(w, 7.0),
+    );
+    p.rect_filled(body, egui::CornerRadius::same(1), col);
+    let tab = egui::Rect::from_min_size(
+        egui::pos2(c.x - w / 2.0, c.y - 5.0),
+        egui::vec2(w * 0.5, 3.0),
+    );
+    p.rect_filled(tab, egui::CornerRadius::same(1), col);
+}
+
+/// Left accent bar (status color) frame ke left edge pe paint karo.
+fn paint_accent(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 1.0, rect.top() + 6.0),
+        egui::pos2(rect.left() + 4.0, rect.bottom() - 6.0),
+    );
+    ui.painter()
+        .rect_filled(bar, egui::CornerRadius::same(2), color);
+}
+
+/// Command duration → "(0.18s)".
+fn fmt_dur(ms: u64) -> String {
+    format!("({:.2}s)", ms as f64 / 1000.0)
+}
+
+/// Header: `~/path (0.18s) git:(branch)` — path + duration + branch color-coded.
+fn header_line(ui: &mut egui::Ui, b: &term::Boundary, theme: Theme) {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if let Some(cwd) = &b.cwd {
+            ui.label(
+                egui::RichText::new(short_path(cwd))
+                    .color(theme.path)
+                    .monospace()
+                    .size(12.0),
+            );
+        }
+        if let Some(br) = &b.branch {
+            ui.label(egui::RichText::new("  git:(").color(theme.muted).monospace().size(12.0));
+            ui.label(egui::RichText::new(br).color(theme.accent).monospace().size(12.0));
+            ui.label(egui::RichText::new(")").color(theme.muted).monospace().size(12.0));
+        }
+    });
+}
+
+fn deja_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::group(ui.style())
+        .fill(egui::Color32::TRANSPARENT) // card = panel bg; sirf border + accent + spacing
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(12)))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin {
+            left: 16,
+            right: 14,
+            top: 10,
+            bottom: 12,
+        })
 }
 
 /// Alternate screen (vim/htop) — poora grid, ek galley, blocks nahi.
-fn render_alt(ui: &mut egui::Ui, font: &egui::FontId, screen: &term::Screen) {
+fn render_alt(ui: &mut egui::Ui, font: &egui::FontId, screen: &term::Screen, theme: Theme) {
     let lines: Vec<&[term::Cell]> = screen.alt.iter().map(|r| r.as_slice()).collect();
     let cursor = Some((screen.acy, screen.acx));
     egui::ScrollArea::vertical()
@@ -442,93 +952,131 @@ fn render_alt(ui: &mut egui::Ui, font: &egui::FontId, screen: &term::Screen) {
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add(
-                egui::Label::new(block_job(&lines, font, cursor)).wrap_mode(egui::TextWrapMode::Extend),
+                egui::Label::new(block_job(&lines, font, cursor, theme))
+                    .wrap_mode(egui::TextWrapMode::Extend),
             );
         });
 }
 
-const C_GREEN: egui::Color32 = egui::Color32::from_rgb(0x23, 0xd1, 0x8b);
 const C_RED: egui::Color32 = egui::Color32::from_rgb(0xf1, 0x4c, 0x4c);
-const C_GRAY: egui::Color32 = egui::Color32::from_rgb(0x88, 0x88, 0x88);
 
-/// Ek block ek bordered frame me — header (status + command + time) + content + diff.
-fn render_one_block(
+/// Finished command card — Warp style: header (path+branch) + bada command + output + diff.
+fn render_card(
     ui: &mut egui::Ui,
     font: &egui::FontId,
-    lines: &[&[term::Cell]],
-    header: Option<&term::Boundary>,
-    cursor: Option<(usize, usize)>,
+    b: &term::Boundary,
+    command: Option<&str>,
+    output: &[&[term::Cell]],
+    theme: Theme,
     diffs: &HashMap<u64, DiffView>,
 ) {
-    egui::Frame::group(ui.style())
-        .fill(term::BG)
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            // header
-            if let Some(bnd) = header {
-                ui.horizontal(|ui| {
-                    let (badge, color) = match bnd.exit {
-                        Some(0) => ("✓".to_string(), C_GREEN),
-                        Some(code) => (format!("✗ {code}"), C_RED),
-                        None => ("▶".to_string(), C_GRAY),
-                    };
-                    ui.label(egui::RichText::new(badge).color(color).monospace());
-                    if let Some(cmd) = &bnd.command {
-                        ui.label(egui::RichText::new(cmd).strong().monospace());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("⧉").on_hover_text("copy block").clicked() {
-                            ui.ctx().copy_text(block_text(lines));
-                        }
-                        if bnd.when > 0 {
-                            ui.label(
-                                egui::RichText::new(deja_core::diff::humanize_since(bnd.when))
-                                    .weak()
-                                    .small(),
-                            );
-                        }
-                    });
-                });
-            }
-            // content
+    let accent = match b.exit {
+        Some(0) => theme.accent,
+        Some(_) => C_RED,
+        None => C_BLUE, // running
+    };
+    let big = egui::FontId::monospace(font.size + 3.0);
+    let inner = deja_frame(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        // header: path + git:(branch) ..... time + copy
+        ui.horizontal(|ui| {
+            header_line(ui, b, theme);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if copy_button(ui, theme) {
+                    ui.ctx().copy_text(block_text(output));
+                }
+                if let Some(ms) = b.dur_ms {
+                    ui.label(
+                        egui::RichText::new(fmt_dur(ms))
+                            .color(theme.muted)
+                            .monospace()
+                            .size(11.0),
+                    );
+                }
+            });
+        });
+        // command — bada, bright
+        if let Some(cmd) = command {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(cmd).font(big.clone()).color(theme.fg));
+        }
+        // output
+        if !output.is_empty() {
+            ui.add_space(4.0);
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add(
-                egui::Label::new(block_job(lines, font, cursor))
+                egui::Label::new(block_job(output, font, None, theme))
                     .wrap_mode(egui::TextWrapMode::Extend)
-                    .selectable(true), // mouse-drag selection
+                    .selectable(true),
             );
-            // diff (failed block ke andar)
-            if let Some(bnd) = header {
-                if let Some(diff) = diffs.get(&bnd.id) {
-                    render_diff(ui, diff);
-                }
-            }
-        });
+        }
+        // Déjà diff (failed block ke andar)
+        if let Some(diff) = diffs.get(&b.id) {
+            ui.add_space(6.0);
+            render_diff(ui, diff, theme);
+        }
+    });
+    paint_accent(ui, inner.response.rect, accent);
 }
 
-fn render_diff(ui: &mut egui::Ui, diff: &DiffView) {
+/// Active prompt / preamble — raw shell prompt + typing + glowing cursor.
+fn render_raw(
+    ui: &mut egui::Ui,
+    font: &egui::FontId,
+    boundary: Option<&term::Boundary>,
+    lines: &[&[term::Cell]],
+    cursor: Option<(usize, usize)>,
+    theme: Theme,
+) {
+    let accent = if boundary.is_some() { C_BLUE } else { theme.muted };
+    let inner = deja_frame(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.add(
+            egui::Label::new(block_job(lines, font, cursor, theme))
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .selectable(true),
+        );
+    });
+    paint_accent(ui, inner.response.rect, accent);
+}
+
+fn render_diff(ui: &mut egui::Ui, diff: &DiffView, theme: Theme) {
     egui::Frame::group(ui.style())
-        .fill(egui::Color32::from_rgb(0x33, 0x26, 0x26))
+        .fill(C_RED.gamma_multiply(0.12))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!(
                     "⏪ Déjà — ye command last {} chali thi. Tab se ye badla:",
                     deja_core::diff::humanize_since(diff.when)
                 ))
-                .color(egui::Color32::from_rgb(0xff, 0xcc, 0x66)),
+                .color(theme.accent)
+                .strong(),
             );
             for c in diff.changes.iter().take(5) {
                 ui.horizontal(|ui| {
-                    ui.monospace(format!("{:<5} {:<14}", c.category, c.key));
-                    ui.monospace(format!("{}  →  {}", c.before, c.after));
+                    ui.label(
+                        egui::RichText::new(format!("{:<5} {:<14}", c.category, c.key))
+                            .color(theme.muted)
+                            .monospace(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{}  →  {}", c.before, c.after))
+                            .color(theme.fg)
+                            .monospace(),
+                    );
                     if c.score >= 80 {
                         ui.label(egui::RichText::new("⚠ likely cause").color(C_RED));
                     }
                 });
             }
             if diff.changes.len() > 5 {
-                ui.label(format!("… +{} aur changes", diff.changes.len() - 5));
+                ui.label(
+                    egui::RichText::new(format!("… +{} aur changes", diff.changes.len() - 5))
+                        .color(theme.muted),
+                );
             }
         });
 }
@@ -587,11 +1135,16 @@ fn snapshot_worker(
 
 /// Ek block ki saari lines ek LayoutJob me (performance: ek galley per block).
 /// cursor = (line_index_within_block, col).
-fn block_job(lines: &[&[term::Cell]], font: &egui::FontId, cursor: Option<(usize, usize)>) -> LayoutJob {
+fn block_job(
+    lines: &[&[term::Cell]],
+    font: &egui::FontId,
+    cursor: Option<(usize, usize)>,
+    theme: Theme,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     for (i, line) in lines.iter().enumerate() {
         let cur = cursor.and_then(|(l, c)| if l == i { Some(c) } else { None });
-        append_line(&mut job, line, font, cur);
+        append_line(&mut job, line, font, cur, theme);
         if i + 1 < lines.len() {
             job.append("\n", 0.0, plain(font));
         }
@@ -623,14 +1176,24 @@ fn plain(font: &egui::FontId) -> TextFormat {
 }
 
 /// Ek line ko colored runs me append karo (same-format cells ek run me).
-fn append_line(job: &mut LayoutJob, line: &[term::Cell], font: &egui::FontId, cursor: Option<usize>) {
+/// "default" colors (term::FG/BG sentinel) ko active theme pe map karta hai.
+fn append_line(
+    job: &mut LayoutJob,
+    line: &[term::Cell],
+    font: &egui::FontId,
+    cursor: Option<usize>,
+    theme: Theme,
+) {
     let mut i = 0;
     while i < line.len() {
         let is_cur = cursor == Some(i);
+        // default colors → theme; cursor = teal glowing block
+        let rfg = theme_fg(line[i].fg, theme);
+        let rbg = theme_bg(line[i].bg, theme);
         let (fg, bg) = if is_cur {
-            (line[i].bg, line[i].fg) // cursor cell inverted
+            (theme.bg, theme.accent)
         } else {
-            (line[i].fg, line[i].bg)
+            (rfg, rbg)
         };
         let mut text = String::new();
         text.push(line[i].ch);

@@ -64,9 +64,15 @@ pub struct Boundary {
     pub id: u64,
     /// global line index (scrollback.len() + cy us waqt) jaha block shuru hua.
     pub start: usize,
+    /// global line jaha se output shuru hua (OSC 133 ; C). Prompt+command isse pehle.
+    pub output_start: usize,
     pub command: Option<String>,
     pub exit: Option<i64>,
     pub when: i64,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    /// Command kitne ms me chali (C se D tak). None = abhi pata nahi.
+    pub dur_ms: Option<u64>,
 }
 
 fn now_unix() -> i64 {
@@ -88,6 +94,8 @@ pub struct Screen {
     pub events: Vec<CmdEvent>,
     /// Warp-style block boundaries (OSC 133 ; A se).
     pub boundaries: Vec<Boundary>,
+    /// Current command ka start time (OSC 133 ; C pe set, D pe duration nikaalte).
+    cmd_start: Option<std::time::Instant>,
     /// Alternate screen (vim/htop jaise full-screen apps) — fixed grid, no scrollback/blocks.
     pub alt_active: bool,
     pub alt: Vec<Vec<Cell>>,
@@ -112,6 +120,7 @@ impl Screen {
             cy: 0,
             events: Vec::new(),
             boundaries: Vec::new(),
+            cmd_start: None,
             alt_active: false,
             alt: vec![vec![Cell::default(); cols]; rows],
             acx: 0,
@@ -403,19 +412,35 @@ impl Perform for Screen {
         }
         let kind = params.get(1).copied().unwrap_or(b"");
 
-        // OSC 133 ; A  → prompt start = naya block boundary
+        // OSC 133 ; A ; <cwd_b64> ; <branch_b64>  → prompt start = naya block boundary
         if kind == b"A" {
             let g = self.cur_global();
+            let cwd = params.get(2).map(|p| b64(p)).filter(|s| !s.is_empty());
+            let branch = params.get(3).map(|p| b64(p)).filter(|s| !s.is_empty());
             // consecutive empty prompts (khaali enter) pe naya block mat banao
             if self.boundaries.last().map_or(true, |b| b.start != g) {
                 self.next_block_id += 1;
                 self.boundaries.push(Boundary {
                     id: self.next_block_id,
                     start: g,
+                    output_start: g,
                     command: None,
                     exit: None,
                     when: 0,
+                    cwd,
+                    branch,
+                    dur_ms: None,
                 });
+            }
+            return;
+        }
+
+        // OSC 133 ; C  → output start (prompt + command isse pehle hai)
+        if kind == b"C" {
+            let g = self.cur_global();
+            self.cmd_start = Some(std::time::Instant::now());
+            if let Some(b) = self.boundaries.last_mut() {
+                b.output_start = g;
             }
             return;
         }
@@ -431,11 +456,14 @@ impl Perform for Screen {
             if command.is_empty() {
                 return;
             }
+            // command kitne der chali
+            let dur = self.cmd_start.take().map(|s| s.elapsed().as_millis() as u64);
             // current block ko finalize karo
             let block_id = if let Some(b) = self.boundaries.last_mut() {
                 b.command = Some(command.clone());
                 b.exit = Some(exit);
                 b.when = now_unix();
+                b.dur_ms = dur;
                 b.id
             } else {
                 0
