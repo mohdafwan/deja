@@ -9,11 +9,25 @@ use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 
 fn main() -> eframe::Result<()> {
+    // CLI: desktop entry manually install/uninstall
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--install-desktop") {
+        install_desktop_entry(true);
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--uninstall-desktop") {
+        uninstall_desktop_entry();
+        return Ok(());
+    }
+    // pehli baar (installed build) → app menu/search me entry auto-banao
+    install_desktop_entry(false);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 600.0])
             .with_title("Déjà")
             .with_icon(make_icon())
+            .with_app_id("deja-term") // launcher entry se window match ho
             .with_decorations(false) // custom title bar (tabs + window buttons)
             .with_resizable(true),
         ..Default::default()
@@ -25,15 +39,13 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Programmatic app icon — dark square + accent "«" (rewind/Déjà feel). Koi asset file nahi.
-fn make_icon() -> egui::IconData {
-    let s = 64usize;
+/// App icon RGBA (dark square + accent "«" rewind/Déjà feel). Koi asset file nahi.
+fn icon_rgba(s: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; s * s * 4];
     let bg = [0x1eu8, 0x1e, 0x1e, 0xff];
     let fg = [0xffu8, 0xcc, 0x66, 0xff];
     let sf = s as f32;
     let thick = sf * 0.08;
-    // do chevrons "«" — har ek do segments ka
     let centers = [0.40f32, 0.62];
     for y in 0..s {
         for x in 0..s {
@@ -44,7 +56,6 @@ fn make_icon() -> egui::IconData {
                 let cy = 0.5 * sf;
                 let w = 0.12 * sf;
                 let h = 0.18 * sf;
-                // "<" : top-right → mid-left → bottom-right
                 let d1 = seg_dist(px, py, cx + w, cy - h, cx - w, cy);
                 let d2 = seg_dist(px, py, cx - w, cy, cx + w, cy + h);
                 if d1 < thick || d2 < thick {
@@ -55,12 +66,97 @@ fn make_icon() -> egui::IconData {
             rgba[i..i + 4].copy_from_slice(if on { &fg } else { &bg });
         }
     }
+    rgba
+}
+
+fn make_icon() -> egui::IconData {
+    let s = 64u32;
     egui::IconData {
-        rgba,
-        width: s as u32,
-        height: s as u32,
+        rgba: icon_rgba(s as usize),
+        width: s,
+        height: s,
     }
 }
+
+#[cfg(target_os = "linux")]
+fn desktop_paths() -> Option<(String, String, String, String)> {
+    let home = std::env::var("HOME").ok()?;
+    let icons_dir = format!("{home}/.local/share/icons");
+    let apps_dir = format!("{home}/.local/share/applications");
+    let icon = format!("{icons_dir}/deja-term.png");
+    let desktop = format!("{apps_dir}/deja-term.desktop");
+    Some((icons_dir, apps_dir, icon, desktop))
+}
+
+/// App ko launcher/search me dikhane ke liye .desktop entry + icon banao (Linux).
+/// `force` = manual command (dev build pe bhi). warna sirf installed build pe.
+#[cfg(target_os = "linux")]
+fn install_desktop_entry(force: bool) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    // dev build (cargo run) pe auto skip — clutter na ho
+    if !force && exe.to_string_lossy().contains("/target/") {
+        return;
+    }
+    let Some((icons_dir, apps_dir, icon, desktop)) = desktop_paths() else { return };
+    if !force
+        && std::path::Path::new(&desktop).exists()
+        && std::path::Path::new(&icon).exists()
+    {
+        return; // pehle se hai
+    }
+    let _ = std::fs::create_dir_all(&icons_dir);
+    let _ = std::fs::create_dir_all(&apps_dir);
+    write_icon_png(&icon, 256);
+    let entry = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Déjà\n\
+         GenericName=Terminal\n\
+         Comment=A terminal that diffs command context (kal chala aaj nahi)\n\
+         Exec={} %U\n\
+         Icon={}\n\
+         Terminal=false\n\
+         StartupWMClass=deja-term\n\
+         Categories=System;TerminalEmulator;Utility;Development;\n\
+         Keywords=terminal;shell;deja;console;\n",
+        exe.display(),
+        icon
+    );
+    let _ = std::fs::write(&desktop, &entry);
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(&apps_dir)
+        .status();
+    if force {
+        println!("✓ Desktop entry installed → app menu/search me 'Déjà' dhundo.");
+        println!("  {desktop}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_desktop_entry() {
+    if let Some((_, _, icon, desktop)) = desktop_paths() {
+        let _ = std::fs::remove_file(&desktop);
+        let _ = std::fs::remove_file(&icon);
+        println!("✓ Desktop entry removed.");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_icon_png(path: &str, size: usize) {
+    let Ok(file) = std::fs::File::create(path) else { return };
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), size as u32, size as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    if let Ok(mut w) = enc.write_header() {
+        let _ = w.write_image_data(&icon_rgba(size));
+    }
+}
+
+// non-Linux: no-ops (Windows/macOS desktop integration alag se)
+#[cfg(not(target_os = "linux"))]
+fn install_desktop_entry(_force: bool) {}
+#[cfg(not(target_os = "linux"))]
+fn uninstall_desktop_entry() {}
 
 /// point se segment ki shortest distance.
 fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
