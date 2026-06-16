@@ -82,6 +82,55 @@ struct DiffView {
 /// Worker thread se aaya diff result.
 type DiffResult = (u64, i64, Vec<deja_core::diff::Change>);
 
+/// Theme = default bg + fg. ANSI-colored cells waise hi rehte; sirf "default"
+/// (term::BG/term::FG sentinel) cells theme ke hisaab se map hote hain.
+#[derive(Clone, Copy)]
+struct Theme {
+    name: &'static str,
+    bg: egui::Color32,
+    fg: egui::Color32,
+}
+
+const THEMES: [Theme; 3] = [
+    Theme {
+        name: "Dark",
+        bg: egui::Color32::from_rgb(0x1e, 0x1e, 0x1e),
+        fg: egui::Color32::from_rgb(0xcc, 0xcc, 0xcc),
+    },
+    Theme {
+        name: "Light",
+        bg: egui::Color32::from_rgb(0xfa, 0xf8, 0xf2),
+        fg: egui::Color32::from_rgb(0x2b, 0x2b, 0x2b),
+    },
+    Theme {
+        name: "Midnight",
+        bg: egui::Color32::from_rgb(0x0f, 0x14, 0x1a),
+        fg: egui::Color32::from_rgb(0xc8, 0xd3, 0xde),
+    },
+];
+
+/// Cell ka stored "default" color (term::FG/BG sentinel) ko active theme pe map karo.
+fn theme_fg(c: egui::Color32, theme: Theme) -> egui::Color32 {
+    if c == term::FG {
+        theme.fg
+    } else {
+        c
+    }
+}
+fn theme_bg(c: egui::Color32, theme: Theme) -> egui::Color32 {
+    if c == term::BG {
+        theme.bg
+    } else {
+        c
+    }
+}
+
+fn apply_theme(ctx: &egui::Context, theme: Theme) {
+    let mut style = (*ctx.global_style()).clone();
+    style.visuals.panel_fill = theme.bg;
+    ctx.set_global_style(style);
+}
+
 /// Ek terminal session (ek tab).
 struct Terminal {
     pty: pty::Pty,
@@ -206,6 +255,7 @@ struct DejaApp {
     active: usize,
     next_id: usize,
     font_size: f32,
+    theme_idx: usize,
 }
 
 impl DejaApp {
@@ -223,10 +273,8 @@ impl DejaApp {
         }
         cc.egui_ctx.set_fonts(fonts);
 
-        // dark background
-        let mut style = (*cc.egui_ctx.global_style()).clone();
-        style.visuals.panel_fill = term::BG;
-        cc.egui_ctx.set_global_style(style);
+        // default theme (Dark)
+        apply_theme(&cc.egui_ctx, THEMES[0]);
 
         let first = Terminal::new(&cc.egui_ctx, 1);
         DejaApp {
@@ -234,7 +282,12 @@ impl DejaApp {
             active: 0,
             next_id: 2,
             font_size: 14.0,
+            theme_idx: 0,
         }
+    }
+
+    fn theme(&self) -> Theme {
+        THEMES[self.theme_idx % THEMES.len()]
     }
 
     fn add_tab(&mut self, ctx: &egui::Context) {
@@ -277,6 +330,21 @@ impl DejaApp {
             }
             if ui.button("+").on_hover_text("new tab (Ctrl+Shift+T)").clicked() {
                 want_new = true;
+            }
+            // theme cycle button (right side)
+            let mut cycle = false;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(format!("🎨 {}", self.theme().name))
+                    .on_hover_text("theme badlo")
+                    .clicked()
+                {
+                    cycle = true;
+                }
+            });
+            if cycle {
+                self.theme_idx = (self.theme_idx + 1) % THEMES.len();
+                apply_theme(ctx, self.theme());
             }
         });
         if let Some(i) = activate {
@@ -354,20 +422,21 @@ impl eframe::App for DejaApp {
 
         // active terminal: resize + input + render
         let active = self.active;
+        let theme = self.theme();
         if let Some(t) = self.tabs.get_mut(active) {
             t.resize_to(rows, cols);
             t.handle_input(ui);
-            t.render_blocks(ui, &font);
+            t.render_blocks(ui, &font, theme);
         }
     }
 }
 
 impl Terminal {
     /// Output ko OSC-133 boundaries ke hisaab se blocks me render karo.
-    fn render_blocks(&self, ui: &mut egui::Ui, font: &egui::FontId) {
+    fn render_blocks(&self, ui: &mut egui::Ui, font: &egui::FontId, theme: Theme) {
         // alt-screen (vim/htop) → poora grid, blocks nahi
         if self.screen.alt_active {
-            render_alt(ui, font, &self.screen);
+            render_alt(ui, font, &self.screen, theme);
             return;
         }
         let sb = self.screen.scrollback.len();
@@ -427,14 +496,14 @@ impl Terminal {
                     }
 
                     let header = bidx.map(|i| &self.screen.boundaries[i]);
-                    render_one_block(ui, font, &lines, header, cursor_in, &self.diffs);
+                    render_one_block(ui, font, &lines, header, cursor_in, &self.diffs, theme);
                 }
             });
     }
 }
 
 /// Alternate screen (vim/htop) — poora grid, ek galley, blocks nahi.
-fn render_alt(ui: &mut egui::Ui, font: &egui::FontId, screen: &term::Screen) {
+fn render_alt(ui: &mut egui::Ui, font: &egui::FontId, screen: &term::Screen, theme: Theme) {
     let lines: Vec<&[term::Cell]> = screen.alt.iter().map(|r| r.as_slice()).collect();
     let cursor = Some((screen.acy, screen.acx));
     egui::ScrollArea::vertical()
@@ -442,7 +511,8 @@ fn render_alt(ui: &mut egui::Ui, font: &egui::FontId, screen: &term::Screen) {
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add(
-                egui::Label::new(block_job(&lines, font, cursor)).wrap_mode(egui::TextWrapMode::Extend),
+                egui::Label::new(block_job(&lines, font, cursor, theme))
+                    .wrap_mode(egui::TextWrapMode::Extend),
             );
         });
 }
@@ -459,9 +529,10 @@ fn render_one_block(
     header: Option<&term::Boundary>,
     cursor: Option<(usize, usize)>,
     diffs: &HashMap<u64, DiffView>,
+    theme: Theme,
 ) {
     egui::Frame::group(ui.style())
-        .fill(term::BG)
+        .fill(theme.bg)
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -494,7 +565,7 @@ fn render_one_block(
             // content
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add(
-                egui::Label::new(block_job(lines, font, cursor))
+                egui::Label::new(block_job(lines, font, cursor, theme))
                     .wrap_mode(egui::TextWrapMode::Extend)
                     .selectable(true), // mouse-drag selection
             );
@@ -587,11 +658,16 @@ fn snapshot_worker(
 
 /// Ek block ki saari lines ek LayoutJob me (performance: ek galley per block).
 /// cursor = (line_index_within_block, col).
-fn block_job(lines: &[&[term::Cell]], font: &egui::FontId, cursor: Option<(usize, usize)>) -> LayoutJob {
+fn block_job(
+    lines: &[&[term::Cell]],
+    font: &egui::FontId,
+    cursor: Option<(usize, usize)>,
+    theme: Theme,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     for (i, line) in lines.iter().enumerate() {
         let cur = cursor.and_then(|(l, c)| if l == i { Some(c) } else { None });
-        append_line(&mut job, line, font, cur);
+        append_line(&mut job, line, font, cur, theme);
         if i + 1 < lines.len() {
             job.append("\n", 0.0, plain(font));
         }
@@ -623,15 +699,21 @@ fn plain(font: &egui::FontId) -> TextFormat {
 }
 
 /// Ek line ko colored runs me append karo (same-format cells ek run me).
-fn append_line(job: &mut LayoutJob, line: &[term::Cell], font: &egui::FontId, cursor: Option<usize>) {
+/// "default" colors (term::FG/BG sentinel) ko active theme pe map karta hai.
+fn append_line(
+    job: &mut LayoutJob,
+    line: &[term::Cell],
+    font: &egui::FontId,
+    cursor: Option<usize>,
+    theme: Theme,
+) {
     let mut i = 0;
     while i < line.len() {
         let is_cur = cursor == Some(i);
-        let (fg, bg) = if is_cur {
-            (line[i].bg, line[i].fg) // cursor cell inverted
-        } else {
-            (line[i].fg, line[i].bg)
-        };
+        // default colors → theme; fir cursor pe invert
+        let rfg = theme_fg(line[i].fg, theme);
+        let rbg = theme_bg(line[i].bg, theme);
+        let (fg, bg) = if is_cur { (rbg, rfg) } else { (rfg, rbg) };
         let mut text = String::new();
         text.push(line[i].ch);
         let mut j = i + 1;
