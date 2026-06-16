@@ -84,6 +84,61 @@ struct DiffView {
 /// Worker thread se aaya diff result.
 type DiffResult = (u64, i64, Vec<deja_core::diff::Change>);
 
+/// Auto-update state (tab bar me dikhta hai).
+#[derive(Clone)]
+enum UpdateState {
+    Idle,
+    Available(String), // newer version tag
+    Updating,
+    Done,
+    Failed,
+}
+
+/// GitHub se latest release tag (curl + serde_json — koi heavy TLS dep nahi).
+fn fetch_latest_tag() -> Option<String> {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sL",
+            "-H",
+            "User-Agent: deja-term",
+            "https://api.github.com/repos/mohdafwan/deja/releases/latest",
+        ])
+        .output()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.get("tag_name")?.as_str().map(|s| s.to_string())
+}
+
+/// "v0.2.2" vs "0.2.1" → newer hai?
+fn is_newer(latest: &str, current: &str) -> bool {
+    fn parse(s: &str) -> (u64, u64, u64) {
+        let s = s.trim().trim_start_matches('v');
+        let mut it = s.split('.').map(|p| p.trim().parse::<u64>().unwrap_or(0));
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    }
+    parse(latest) > parse(current)
+}
+
+/// cargo-dist ka prebuilt `deja-term-update` chalao (installer ne ship kiya).
+fn run_updater() -> bool {
+    let mut candidates = vec![std::path::PathBuf::from("deja-term-update")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("deja-term-update"));
+        }
+    }
+    for c in candidates {
+        if let Ok(st) = std::process::Command::new(&c).status() {
+            return st.success();
+        }
+    }
+    false
+}
+
 /// Theme = default bg + fg + accent colors. ANSI-colored cells waise hi rehte;
 /// sirf "default" (term::BG/term::FG sentinel) cells theme pe map hote hain.
 #[derive(Clone, Copy)]
@@ -289,6 +344,9 @@ struct DejaApp {
     active: usize,
     font_size: f32,
     theme_idx: usize,
+    update: UpdateState,
+    update_tx: Sender<UpdateState>,
+    update_rx: Receiver<UpdateState>,
 }
 
 impl DejaApp {
@@ -309,12 +367,30 @@ impl DejaApp {
         // default theme (Dark)
         apply_theme(&cc.egui_ctx, THEMES[0]);
 
+        // background update check (curl GitHub API; receipt-installed builds ke liye)
+        let (update_tx, update_rx) = std::sync::mpsc::channel::<UpdateState>();
+        {
+            let tx = update_tx.clone();
+            let uctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                if let Some(latest) = fetch_latest_tag() {
+                    if is_newer(&latest, env!("CARGO_PKG_VERSION")) {
+                        let _ = tx.send(UpdateState::Available(latest));
+                        uctx.request_repaint();
+                    }
+                }
+            });
+        }
+
         let first = Terminal::new(&cc.egui_ctx);
         DejaApp {
             tabs: vec![first],
             active: 0,
             font_size: 14.0,
             theme_idx: 0,
+            update: UpdateState::Idle,
+            update_tx,
+            update_rx,
         }
     }
 
@@ -352,6 +428,7 @@ impl DejaApp {
         let mut win_min = false;
         let mut win_max = false;
         let mut win_close = false;
+        let mut start_update = false;
 
         // window drag + double-click maximize (background — buttons iske upar render hote)
         let title_resp = ui.interact(
@@ -496,6 +573,52 @@ impl DejaApp {
                 {
                     cycle = true;
                 }
+                // update status (theme ke left me)
+                ui.add_space(6.0);
+                match self.update.clone() {
+                    UpdateState::Available(v) => {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("Update {v}"))
+                                        .color(theme.accent)
+                                        .size(12.0),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("naya version — click karke install karo")
+                            .clicked()
+                        {
+                            start_update = true;
+                        }
+                    }
+                    UpdateState::Updating => {
+                        ui.label(egui::RichText::new("updating...").color(theme.muted).size(12.0));
+                    }
+                    UpdateState::Done => {
+                        ui.label(
+                            egui::RichText::new("restart to apply")
+                                .color(theme.accent)
+                                .size(12.0),
+                        );
+                    }
+                    UpdateState::Failed => {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("update failed - retry")
+                                        .color(C_RED)
+                                        .size(12.0),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            start_update = true;
+                        }
+                    }
+                    UpdateState::Idle => {}
+                }
             });
         });
 
@@ -522,6 +645,21 @@ impl DejaApp {
         if win_max {
             let m = ui.input(|i| i.viewport().maximized.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!m));
+        }
+        // update install → background me deja-term-update chalao
+        if start_update {
+            self.update = UpdateState::Updating;
+            let tx = self.update_tx.clone();
+            let uctx = ctx.clone();
+            std::thread::spawn(move || {
+                let ok = run_updater();
+                let _ = tx.send(if ok {
+                    UpdateState::Done
+                } else {
+                    UpdateState::Failed
+                });
+                uctx.request_repaint();
+            });
         }
     }
 }
@@ -571,6 +709,10 @@ impl eframe::App for DejaApp {
         // saare tabs ka state update karo (background bhi chale)
         for t in &mut self.tabs {
             t.pump();
+        }
+        // update-check thread se messages
+        while let Ok(st) = self.update_rx.try_recv() {
+            self.update = st;
         }
 
         let theme = self.theme();

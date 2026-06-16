@@ -838,7 +838,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "deja-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "deja-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "dirs",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "deja-term"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -867,6 +867,7 @@ dependencies = [
  "eframe",
  "egui",
  "portable-pty",
+ "serde_json",
  "vte",
 ]
 
