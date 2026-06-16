@@ -117,15 +117,9 @@ fn install_desktop_entry(force: bool) {
         return;
     }
     let Some((icons_dir, apps_dir, icon, desktop)) = desktop_paths() else { return };
-    if !force
-        && std::path::Path::new(&desktop).exists()
-        && std::path::Path::new(&icon).exists()
-    {
-        return; // pehle se hai
-    }
     let _ = std::fs::create_dir_all(&icons_dir);
     let _ = std::fs::create_dir_all(&apps_dir);
-    write_icon_png(&icon);
+
     let entry = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -141,12 +135,23 @@ fn install_desktop_entry(force: bool) {
         exe.display(),
         icon
     );
-    let _ = std::fs::write(&desktop, &entry);
-    let _ = std::process::Command::new("update-desktop-database")
-        .arg(&apps_dir)
-        .status();
+
+    // sirf tab likho jab content badla ho (update pe icon refresh ho jaaye)
+    let icon_changed = std::fs::read(&icon).map_or(true, |b| b != LOGO_PNG);
+    let desktop_changed = std::fs::read_to_string(&desktop).map_or(true, |s| s != entry);
+    if force || icon_changed {
+        write_icon_png(&icon);
+    }
+    if force || desktop_changed {
+        let _ = std::fs::write(&desktop, &entry);
+    }
+    if force || icon_changed || desktop_changed {
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(&apps_dir)
+            .status();
+    }
     if force {
-        println!("✓ Desktop entry installed → app menu/search me 'Déjà' dhundo.");
+        println!("✓ Desktop entry refreshed → app menu/search me 'Déjà' dhundo.");
         println!("  {desktop}");
     }
 }
