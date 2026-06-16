@@ -177,6 +177,182 @@ fn install_desktop_entry(_force: bool) {}
 #[cfg(not(target_os = "linux"))]
 fn uninstall_desktop_entry() {}
 
+// ===================== Tab completion + ghost suggestion =====================
+
+const SKIP_FIRST_TOKEN: bool = true; // pehla token = program naam, path nahi
+const MAX_COMPLETIONS: usize = 60;
+
+#[derive(Clone)]
+struct CompletionItem {
+    name: String,
+    is_dir: bool,
+}
+
+#[derive(Default)]
+struct CompletionState {
+    items: Vec<CompletionItem>,
+    selected: usize,
+    /// input ke andar byte-range jo replace hoga
+    replace_range: Option<(usize, usize)>,
+    open: bool,
+}
+
+impl CompletionState {
+    fn close(&mut self) {
+        self.items.clear();
+        self.selected = 0;
+        self.replace_range = None;
+        self.open = false;
+    }
+    fn next(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = (self.selected + 1) % self.items.len();
+        }
+    }
+    fn prev(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = (self.selected + self.items.len() - 1) % self.items.len();
+        }
+    }
+}
+
+/// input ka aakhri whitespace-token: (start_byte, token, is_first_token).
+fn last_token(input: &str) -> (usize, &str, bool) {
+    let mut start = 0usize;
+    let mut seen = false;
+    let mut in_ws = false;
+    for (i, c) in input.char_indices() {
+        if c.is_whitespace() {
+            in_ws = true;
+        } else {
+            if in_ws {
+                start = i;
+                seen = true;
+            }
+            in_ws = false;
+        }
+    }
+    if in_ws {
+        start = input.len();
+        seen = true;
+    }
+    (start, &input[start..], !seen)
+}
+
+fn expand_tilde(p: &str) -> String {
+    if p == "~" {
+        std::env::var("HOME").unwrap_or_else(|_| "~".into())
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(h) => format!("{h}/{rest}"),
+            Err(_) => p.to_string(),
+        }
+    } else {
+        p.to_string()
+    }
+}
+
+/// token → (dir_to_read, prefix_to_match, prefix_offset_within_token).
+fn split_dir_prefix(token: &str, cwd_abs: &str) -> (String, String, usize) {
+    match token.rfind('/') {
+        Some(slash) => {
+            let dir = expand_tilde(&token[..=slash]);
+            let dir = if dir.starts_with('/') {
+                dir
+            } else {
+                format!("{}/{}", cwd_abs.trim_end_matches('/'), dir)
+            };
+            (dir, token[slash + 1..].to_string(), slash + 1)
+        }
+        None => (cwd_abs.to_string(), token.to_string(), 0),
+    }
+}
+
+/// cwd ABSOLUTE hona chahiye (Boundary.cwd, active_cwd() nahi).
+fn compute_completions(input: &str, cwd: &str) -> (Vec<CompletionItem>, Option<(usize, usize)>) {
+    let (tok_start, token, is_first) = last_token(input);
+    if SKIP_FIRST_TOKEN && is_first {
+        return (Vec::new(), None);
+    }
+    let (dir, prefix, prefix_off) = split_dir_prefix(token, cwd);
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return (Vec::new(), None),
+    };
+    let mut items = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if name.starts_with('.') && !prefix.starts_with('.') {
+            continue;
+        }
+        let is_dir = e
+            .file_type()
+            .map(|t| t.is_dir())
+            .ok()
+            .or_else(|| e.metadata().map(|m| m.is_dir()).ok())
+            .unwrap_or(false);
+        items.push(CompletionItem { name, is_dir });
+    }
+    items.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    items.truncate(MAX_COMPLETIONS);
+    let range = if items.is_empty() {
+        None
+    } else {
+        Some((tok_start + prefix_off, input.len()))
+    };
+    (items, range)
+}
+
+/// chosen item ko input me splice karo → (new_input, new_caret_byte).
+fn apply_completion(input: &str, range: (usize, usize), item: &CompletionItem) -> String {
+    let (s, e) = (range.0.min(input.len()), range.1.min(input.len()));
+    let suffix = if item.is_dir { "/" } else { " " };
+    format!("{}{}{}{}", &input[..s], item.name, suffix, &input[e..])
+}
+
+/// history me se newest entry jo input se start hota — ghost remainder.
+fn ghost_suggestion(input: &str, history: &[String]) -> Option<String> {
+    if input.is_empty() {
+        return None;
+    }
+    history
+        .iter()
+        .rev()
+        .find(|h| h.as_str() != input && h.starts_with(input))
+        .map(|h| h[input.len()..].to_string())
+}
+
+fn history_push(history: &mut Vec<String>, line: &str) {
+    let line = line.trim();
+    if line.is_empty() || history.last().map(|s| s.as_str()) == Some(line) {
+        return;
+    }
+    history.push(line.to_string());
+}
+
+/// deja-core DB se recent commands load karo (ghost suggestion ke liye, chronological).
+fn seed_history() -> Vec<String> {
+    let mut h = Vec::new();
+    if let Ok(conn) = deja_core::db::open() {
+        if let Ok(mut rows) = deja_core::db::recent_runs(&conn, 300) {
+            rows.reverse(); // recent_runs DESC → chronological
+            for r in rows {
+                history_push(&mut h, &r.command);
+            }
+        }
+    }
+    h
+}
+
+// ============================================================================
+
 /// Fail hui command ka diff jo block ke andar dikhta hai.
 struct DiffView {
     when: i64,
@@ -327,6 +503,12 @@ struct Terminal {
     input: String,
     /// Submit ki hui command jo abhi chal rahi (running card me dikhti, D pe clear).
     running: Option<String>,
+    /// command history (ghost-suggestion ke liye), DB se seed + session me append.
+    history: Vec<String>,
+    /// Tab completion popup state.
+    comp: CompletionState,
+    /// shell exit ho gaya (PTY EOF) → ye tab close karna hai.
+    dead: bool,
 }
 
 impl Terminal {
@@ -352,14 +534,24 @@ impl Terminal {
             diff_rx,
             input: String::new(),
             running: None,
+            history: seed_history(),
+            comp: CompletionState::default(),
+            dead: false,
         }
     }
 
     /// Per-frame state update (UI nahi): shell output process + events + diffs.
     /// Background tabs bhi update hote rehte hain.
     fn pump(&mut self) {
-        while let Ok(bytes) = self.rx.try_recv() {
-            self.parser.advance(&mut self.screen, &bytes);
+        loop {
+            match self.rx.try_recv() {
+                Ok(bytes) => self.parser.advance(&mut self.screen, &bytes),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.dead = true; // shell exit ho gaya (PTY EOF) → tab close
+                    break;
+                }
+            }
         }
         let events: Vec<term::CmdEvent> = std::mem::take(&mut self.screen.events);
         if !events.is_empty() {
@@ -812,6 +1004,17 @@ impl eframe::App for DejaApp {
         for t in &mut self.tabs {
             t.pump();
         }
+        // jin tabs ka shell exit ho gaya (exit/Ctrl+D) → close (last → app band)
+        let dead: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.dead)
+            .map(|(i, _)| i)
+            .collect();
+        for &idx in dead.iter().rev() {
+            self.close_tab(idx, &ctx);
+        }
         // update-check thread se messages
         while let Ok(st) = self.update_rx.try_recv() {
             self.update = st;
@@ -825,14 +1028,20 @@ impl eframe::App for DejaApp {
         let char_w = galley.size().x.max(1.0);
         let row_h = galley.size().y.max(1.0);
         let active = self.active;
-        let alt = self.tabs.get(active).map_or(false, |t| t.screen.alt_active);
+        // raw mode = alt-screen (vim) YA koi command chal rahi (claude/python/ssh)
+        // → keystrokes seedha PTY ko (line-editor nahi), input bar chhupa do.
+        let raw_mode = self
+            .tabs
+            .get(active)
+            .map_or(false, |t| t.screen.alt_active || t.running.is_some());
 
-        // Ctrl+C / Ctrl+D (non-alt) → seedha PTY (interrupt / EOF)
-        if !alt {
-            let (cc, cd) = ui.input(|i| {
+        // Ctrl+C / Ctrl+D / Ctrl+L — sirf prompt pe (raw mode me forward_raw handle karta)
+        if !raw_mode {
+            let (cc, cd, cl) = ui.input(|i| {
                 (
                     i.modifiers.ctrl && i.key_pressed(egui::Key::C),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::D),
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::L),
                 )
             });
             if let Some(t) = self.tabs.get_mut(active) {
@@ -843,6 +1052,12 @@ impl eframe::App for DejaApp {
                 if cd && t.input.is_empty() {
                     t.pty.write(&[0x04]);
                 }
+                if cl {
+                    // Ctrl+L → saare blocks clear + shell ko fresh prompt redraw
+                    t.screen.clear_all();
+                    t.running = None;
+                    t.pty.write(b"\n");
+                }
             }
         }
 
@@ -851,8 +1066,8 @@ impl eframe::App for DejaApp {
             .frame(egui::Frame::default().fill(theme.bg)) // no margin → tabs edge-to-edge
             .show_inside(ui, |ui| self.tab_bar(ui, &ctx, theme));
 
-        // BOTTOM — fixed input field (Warp style). Alt-screen apps me chhupa do.
-        if !alt {
+        // BOTTOM — fixed input field. Raw mode (running cmd / alt-screen) me chhupa do.
+        if !raw_mode {
             egui::TopBottomPanel::bottom("deja_input")
                 .frame(
                     egui::Frame::default()
@@ -876,8 +1091,8 @@ impl eframe::App for DejaApp {
                 let rows = ((avail.y / row_h).floor() as usize).max(5);
                 if let Some(t) = self.tabs.get_mut(active) {
                     t.resize_to(rows, cols);
-                    if t.screen.alt_active {
-                        t.forward_raw(ui); // vim/htop ke raw keys
+                    if t.screen.alt_active || t.running.is_some() {
+                        t.forward_raw(ui); // raw keys → running cmd / vim / claude
                     }
                     t.render_history(ui, &font, theme);
                 }
@@ -987,6 +1202,15 @@ impl Terminal {
             return;
         }
         let big = egui::FontId::monospace(font.size + 2.0);
+        // fs ops ke liye RAW absolute cwd (active_cwd() short "~" display hai — galat)
+        let cwd_abs = self
+            .screen
+            .boundaries
+            .last()
+            .and_then(|b| b.cwd.clone())
+            .or_else(|| std::env::var("HOME").ok())
+            .unwrap_or_else(|| "/".into());
+
         ui.horizontal(|ui| {
             // path chip (folder)
             let chip = self.active_cwd().unwrap_or_else(|| "~".to_string());
@@ -996,37 +1220,244 @@ impl Terminal {
                 .inner_margin(egui::Margin::symmetric(7, 3))
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 5.0;
-                    // folder icon (manually drawn)
                     let (ir, _) =
                         ui.allocate_exact_size(egui::vec2(13.0, 14.0), egui::Sense::hover());
                     folder_icon(&ui.painter_at(ir), ir.center(), theme.path);
                     ui.label(egui::RichText::new(chip).color(theme.path).size(12.0));
                 });
 
-            // input field
-            let te = egui::TextEdit::singleline(&mut self.input)
+            // special keys consume karo (TextEdit/focus-move ko leak na ho).
+            // Tab hamesha; Up/Down/Enter/Esc sirf jab popup open ho.
+            let popup_open = self.comp.open;
+            let (k_tab, k_up, k_down, k_enter, k_esc) = ui.input_mut(|i| {
+                let tab = i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+                if popup_open {
+                    (
+                        tab,
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                    )
+                } else {
+                    (tab, false, false, false, false)
+                }
+            });
+
+            // input field (.show → galley/cursor milte hain)
+            let out = egui::TextEdit::singleline(&mut self.input)
                 .frame(egui::Frame::default())
                 .font(big.clone())
                 .text_color(theme.fg)
                 .hint_text(egui::RichText::new("type a command…").color(theme.muted))
-                .desired_width(f32::INFINITY);
-            let resp = ui.add(te);
+                .desired_width(f32::INFINITY)
+                .show(ui);
+            let id = out.response.id;
+            let mut mutated = false;
+
+            // user ne type kiya → stale popup band
+            if out.response.changed() {
+                self.comp.close();
+            }
+
+            if self.comp.open {
+                if k_up {
+                    self.comp.prev();
+                }
+                if k_down {
+                    self.comp.next();
+                }
+                if k_esc {
+                    self.comp.close();
+                }
+                if k_tab || k_enter {
+                    if let (Some(item), Some(range)) = (
+                        self.comp.items.get(self.comp.selected).cloned(),
+                        self.comp.replace_range,
+                    ) {
+                        self.input = apply_completion(&self.input, range, &item);
+                        set_caret_end(ui.ctx(), id, self.input.chars().count());
+                        mutated = true;
+                    }
+                    self.comp.close();
+                }
+            } else {
+                if k_tab {
+                    let (items, range) = compute_completions(&self.input, &cwd_abs);
+                    if !items.is_empty() {
+                        self.comp.items = items;
+                        self.comp.selected = 0;
+                        self.comp.replace_range = range;
+                        self.comp.open = true;
+                    } else if let Some(g) = ghost_suggestion(&self.input, &self.history) {
+                        self.input.push_str(&g); // kuch complete nahi → ghost accept
+                        set_caret_end(ui.ctx(), id, self.input.chars().count());
+                        mutated = true;
+                    }
+                }
+                // Enter → submit (popup band hai)
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let line = std::mem::take(&mut self.input);
+                    history_push(&mut self.history, &line);
+                    self.pty.write(line.as_bytes());
+                    self.pty.write(b"\n");
+                    if !line.trim().is_empty() {
+                        self.running = Some(line);
+                    }
+                    mutated = true;
+                }
+            }
+
+            // ghost suggestion (popup band na ho, input non-empty)
+            if !mutated && !self.comp.open && !self.input.is_empty() {
+                if let Some(g) = ghost_suggestion(&self.input, &self.history) {
+                    let p = ui.painter_at(out.response.rect);
+                    // typed text ki width measure karke uske aage ghost paint
+                    let tw = p
+                        .layout_no_wrap(self.input.clone(), big.clone(), theme.fg)
+                        .size()
+                        .x;
+                    let pos = out.galley_pos + egui::vec2(tw, 0.0);
+                    let hint = format!("{g}   → tab");
+                    p.text(pos, egui::Align2::LEFT_TOP, hint, big.clone(), theme.muted);
+                }
+            }
+
+            // completion popup (input bar ke upar floating)
+            if self.comp.open {
+                let rect = out.response.rect;
+                let mut clicked: Option<usize> = None;
+                let mut hover: Option<usize> = None;
+                let sel = self.comp.selected;
+                egui::Area::new(egui::Id::new("deja_completion"))
+                    .order(egui::Order::Foreground)
+                    .pivot(egui::Align2::LEFT_BOTTOM)
+                    .fixed_pos(rect.left_top() - egui::vec2(0.0, 4.0))
+                    .constrain(true)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(rect.width().clamp(300.0, 560.0));
+                            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                                ui.with_layout(
+                                    egui::Layout::top_down_justified(egui::Align::LEFT),
+                                    |ui| {
+                                        for (idx, item) in self.comp.items.iter().enumerate() {
+                                            let row = ui.selectable_label(idx == sel, "");
+                                            let rr = row.rect;
+                                            let p = ui.painter_at(rr);
+                                            let pad = 8.0;
+                                            completion_icon(
+                                                &p,
+                                                rr.left_center() + egui::vec2(pad + 6.0, 0.0),
+                                                item.is_dir,
+                                                theme,
+                                            );
+                                            p.text(
+                                                rr.left_center() + egui::vec2(pad + 22.0, 0.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                &item.name,
+                                                egui::FontId::monospace(13.0),
+                                                theme.fg,
+                                            );
+                                            p.text(
+                                                rr.right_center() - egui::vec2(pad, 0.0),
+                                                egui::Align2::RIGHT_CENTER,
+                                                if item.is_dir { "Directory" } else { "File" },
+                                                egui::FontId::proportional(11.0),
+                                                theme.muted,
+                                            );
+                                            if row.clicked() {
+                                                clicked = Some(idx);
+                                            }
+                                            if row.hovered() {
+                                                hover = Some(idx);
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    });
+                if let Some(h) = hover {
+                    self.comp.selected = h;
+                }
+                if let Some(c) = clicked {
+                    if let (Some(item), Some(range)) =
+                        (self.comp.items.get(c).cloned(), self.comp.replace_range)
+                    {
+                        self.input = apply_completion(&self.input, range, &item);
+                        set_caret_end(ui.ctx(), id, self.input.chars().count());
+                    }
+                    self.comp.close();
+                }
+            }
 
             // hamesha focused rakho (terminal feel)
-            if !resp.has_focus() {
-                resp.request_focus();
-            }
-            // Enter → submit (input field hamesha focused hai)
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                let line = std::mem::take(&mut self.input);
-                self.pty.write(line.as_bytes());
-                self.pty.write(b"\n");
-                if !line.is_empty() {
-                    self.running = Some(line);
-                }
-                resp.request_focus();
+            if !out.response.has_focus() {
+                out.response.request_focus();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod comp_tests {
+    use super::*;
+
+    #[test]
+    fn last_token_basics() {
+        assert_eq!(last_token("ls"), (0, "ls", true)); // first token
+        assert_eq!(last_token("cd src"), (3, "src", false));
+        assert_eq!(last_token("cd "), (3, "", false)); // trailing space → empty arg
+    }
+
+    #[test]
+    fn apply_dir_and_file() {
+        let dir = CompletionItem { name: "src".into(), is_dir: true };
+        assert_eq!(apply_completion("cd sr", (3, 5), &dir), "cd src/");
+        let file = CompletionItem { name: "main.rs".into(), is_dir: false };
+        assert_eq!(apply_completion("cat ma", (4, 6), &file), "cat main.rs ");
+    }
+
+    #[test]
+    fn ghost_from_history() {
+        let h = vec!["ls -la".to_string(), "git status".to_string()];
+        assert_eq!(ghost_suggestion("git", &h), Some(" status".into()));
+        assert_eq!(ghost_suggestion("xyz", &h), None);
+        assert_eq!(ghost_suggestion("git status", &h), None); // exact = no ghost
+    }
+
+    #[test]
+    fn fs_completions_dirs_first() {
+        let dir = std::env::temp_dir().join(format!("deja_comp_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("alpha_dir"));
+        let _ = std::fs::write(dir.join("alphabet.txt"), b"x");
+        let _ = std::fs::write(dir.join("beta.txt"), b"x");
+        let cwd = dir.to_string_lossy().to_string();
+        let (items, range) = compute_completions("cat al", &cwd);
+        let names: Vec<_> = items.iter().map(|i| (i.name.as_str(), i.is_dir)).collect();
+        assert_eq!(names, vec![("alpha_dir", true), ("alphabet.txt", false)]);
+        assert_eq!(range, Some((4, 6)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// TextEdit ka caret end pe le jao (programmatic input change ke baad).
+fn set_caret_end(ctx: &egui::Context, id: egui::Id, n: usize) {
+    if let Some(mut st) = egui::TextEdit::load_state(ctx, id) {
+        let c = egui::text::CCursor::new(n);
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(c)));
+        egui::TextEdit::store_state(ctx, id, st);
+    }
+}
+
+/// Completion popup row ka icon (dir = folder, file = page).
+fn completion_icon(p: &egui::Painter, c: egui::Pos2, is_dir: bool, theme: Theme) {
+    if is_dir {
+        folder_icon(p, c, theme.accent);
+    } else {
+        let fr = egui::Rect::from_center_size(c, egui::vec2(9.0, 11.0));
+        p.rect_filled(fr, egui::CornerRadius::same(1), theme.muted);
     }
 }
 

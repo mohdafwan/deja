@@ -167,6 +167,15 @@ impl Screen {
         Cell { ch: ' ', fg: self.cur_fg, bg: self.cur_bg }
     }
 
+    /// Sab kuch wipe: grid + scrollback + blocks + cursor home. (`clear` / Ctrl+L)
+    pub fn clear_all(&mut self) {
+        self.grid = vec![vec![Cell::default(); self.cols]; self.rows];
+        self.scrollback.clear();
+        self.boundaries.clear();
+        self.cx = 0;
+        self.cy = 0;
+    }
+
     fn newline(&mut self) {
         if self.cy + 1 >= self.rows {
             // scroll: top line scrollback me, neeche blank
@@ -235,7 +244,9 @@ impl Screen {
             self.bold = false;
             return;
         }
-        for &p in ps {
+        let mut i = 0;
+        while i < ps.len() {
+            let p = ps[i];
             match p {
                 0 => {
                     self.cur_fg = FG;
@@ -250,14 +261,72 @@ impl Screen {
                 49 => self.cur_bg = BG,
                 90..=97 => self.cur_fg = ansi_color(p - 90, true),
                 100..=107 => self.cur_bg = ansi_color(p - 100, true),
+                // 256-color / truecolor: 38;5;n | 38;2;r;g;b (fg), 48;... (bg)
+                38 | 48 => {
+                    let is_fg = p == 38;
+                    if let Some(&mode) = ps.get(i + 1) {
+                        if mode == 5 {
+                            if let Some(&n) = ps.get(i + 2) {
+                                let c = color256(n);
+                                if is_fg {
+                                    self.cur_fg = c;
+                                } else {
+                                    self.cur_bg = c;
+                                }
+                                i += 2;
+                            }
+                        } else if mode == 2 {
+                            if let (Some(&r), Some(&g), Some(&b)) =
+                                (ps.get(i + 2), ps.get(i + 3), ps.get(i + 4))
+                            {
+                                let c = Color32::from_rgb(r as u8, g as u8, b as u8);
+                                if is_fg {
+                                    self.cur_fg = c;
+                                } else {
+                                    self.cur_bg = c;
+                                }
+                                i += 4;
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
+            i += 1;
         }
     }
 }
 
+/// xterm 256-color palette → Color32.
+fn color256(n: u16) -> Color32 {
+    match n {
+        0..=7 => NORMAL[n as usize],
+        8..=15 => BRIGHT[(n - 8) as usize],
+        16..=231 => {
+            let c = n - 16;
+            let r = c / 36;
+            let g = (c % 36) / 6;
+            let b = c % 6;
+            let v = |x: u16| -> u8 {
+                if x == 0 {
+                    0
+                } else {
+                    (55 + x * 40) as u8
+                }
+            };
+            Color32::from_rgb(v(r), v(g), v(b))
+        }
+        232..=255 => {
+            let l = (8 + (n - 232) * 10) as u8;
+            Color32::from_rgb(l, l, l)
+        }
+        _ => FG,
+    }
+}
+
+/// Saare subparams flatten (38;5;n aur 38:5:n dono forms handle ho).
 fn collect_params(params: &Params) -> Vec<u16> {
-    params.iter().map(|p| p.first().copied().unwrap_or(0)).collect()
+    params.iter().flat_map(|p| p.iter().copied()).collect()
 }
 
 /// Kisi bhi grid pe erase-line (main ya alt buffer dono ke liye).
@@ -374,6 +443,12 @@ impl Perform for Screen {
         // SGR pehle (grid borrow se pehle, kyunki ye cur_fg/cur_bg badalta hai)
         if action == 'm' {
             self.sgr(&ps);
+            return;
+        }
+
+        // `clear` → ESC[3J (erase scrollback). Block model me = saare blocks wipe.
+        if action == 'J' && !self.alt_active && ps.first().copied().unwrap_or(0) == 3 {
+            self.clear_all();
             return;
         }
 
@@ -591,6 +666,32 @@ mod tests {
         feed(&mut s, b"\x1b]133;A\x07");
         feed(&mut s, b"\x1b]133;A\x07");
         assert_eq!(s.boundaries.len(), 1);
+    }
+
+    #[test]
+    fn sgr_256_and_truecolor() {
+        let mut s = Screen::new(5, 20);
+        feed(&mut s, b"\x1b[38;5;196mA"); // 256-color red
+        assert_eq!(s.grid[0][0].fg, color256(196));
+        feed(&mut s, b"\x1b[38;2;255;128;0mB"); // truecolor orange
+        assert_eq!(s.grid[0][1].fg, Color32::from_rgb(255, 128, 0));
+        feed(&mut s, b"\x1b[48;2;10;20;30mC"); // truecolor bg
+        assert_eq!(s.grid[0][2].bg, Color32::from_rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn clear_wipes_blocks_and_scrollback() {
+        let mut s = Screen::new(3, 20);
+        // do commands (boundaries banao) + scrollback bharo
+        feed(&mut s, b"\x1b]133;A\x07cmd1\r\nout\r\n");
+        feed(&mut s, b"\x1b]133;A\x07cmd2\r\nl1\r\nl2\r\nl3\r\n");
+        assert!(!s.boundaries.is_empty());
+        // `clear` → ESC[3J
+        feed(&mut s, b"\x1b[3J");
+        assert!(s.boundaries.is_empty(), "boundaries cleared");
+        assert!(s.scrollback.is_empty(), "scrollback cleared");
+        assert_eq!((s.cy, s.cx), (0, 0));
+        assert_eq!(s.grid[0][0].ch, ' ');
     }
 
     #[test]
