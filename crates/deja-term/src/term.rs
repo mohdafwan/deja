@@ -64,9 +64,13 @@ pub struct Boundary {
     pub id: u64,
     /// global line index (scrollback.len() + cy us waqt) jaha block shuru hua.
     pub start: usize,
+    /// global line jaha se output shuru hua (OSC 133 ; C). Prompt+command isse pehle.
+    pub output_start: usize,
     pub command: Option<String>,
     pub exit: Option<i64>,
     pub when: i64,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
 }
 
 fn now_unix() -> i64 {
@@ -403,19 +407,33 @@ impl Perform for Screen {
         }
         let kind = params.get(1).copied().unwrap_or(b"");
 
-        // OSC 133 ; A  → prompt start = naya block boundary
+        // OSC 133 ; A ; <cwd_b64> ; <branch_b64>  → prompt start = naya block boundary
         if kind == b"A" {
             let g = self.cur_global();
+            let cwd = params.get(2).map(|p| b64(p)).filter(|s| !s.is_empty());
+            let branch = params.get(3).map(|p| b64(p)).filter(|s| !s.is_empty());
             // consecutive empty prompts (khaali enter) pe naya block mat banao
             if self.boundaries.last().map_or(true, |b| b.start != g) {
                 self.next_block_id += 1;
                 self.boundaries.push(Boundary {
                     id: self.next_block_id,
                     start: g,
+                    output_start: g,
                     command: None,
                     exit: None,
                     when: 0,
+                    cwd,
+                    branch,
                 });
+            }
+            return;
+        }
+
+        // OSC 133 ; C  → output start (prompt + command isse pehle hai)
+        if kind == b"C" {
+            let g = self.cur_global();
+            if let Some(b) = self.boundaries.last_mut() {
+                b.output_start = g;
             }
             return;
         }
