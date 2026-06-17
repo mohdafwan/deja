@@ -1091,7 +1091,11 @@ impl eframe::App for DejaApp {
                 let rows = ((avail.y / row_h).floor() as usize).max(5);
                 if let Some(t) = self.tabs.get_mut(active) {
                     t.resize_to(rows, cols);
-                    if t.screen.alt_active || t.running.is_some() {
+                    // frame-start raw_mode use karo (running.is_some() dobara NAHI).
+                    // warna jis frame me Enter pe command submit hoti hai usi frame
+                    // forward_raw wahi Enter event phir se PTY ko bhej deta → double
+                    // newline → khaali prompt block ("enter twice" bug).
+                    if raw_mode {
                         t.forward_raw(ui); // raw keys → running cmd / vim / claude
                     }
                     t.render_history(ui, &font, theme);
