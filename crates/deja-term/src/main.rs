@@ -509,6 +509,8 @@ struct Terminal {
     comp: CompletionState,
     /// shell exit ho gaya (PTY EOF) → ye tab close karna hai.
     dead: bool,
+    /// pichle frame me history content ki height (bottom-anchor spacer ke liye).
+    hist_h: f32,
 }
 
 impl Terminal {
@@ -537,6 +539,7 @@ impl Terminal {
             history: seed_history(),
             comp: CompletionState::default(),
             dead: false,
+            hist_h: 0.0,
         }
     }
 
@@ -592,6 +595,9 @@ impl Terminal {
                 match ev {
                     egui::Event::Text(t) => out.extend_from_slice(t.as_bytes()),
                     egui::Event::Paste(t) => out.extend_from_slice(t.as_bytes()),
+                    // egui Ctrl+C ko Copy event bana deta hai — running cmd me ye
+                    // SIGINT hona chahiye (raw passthrough me select-copy hota nahi).
+                    egui::Event::Copy => out.push(0x03),
                     egui::Event::Key {
                         key,
                         pressed: true,
@@ -1038,8 +1044,12 @@ impl eframe::App for DejaApp {
         // Ctrl+C / Ctrl+D / Ctrl+L — sirf prompt pe (raw mode me forward_raw handle karta)
         if !raw_mode {
             let (cc, cd, cl) = ui.input(|i| {
+                // egui Ctrl+C → Event::Copy (raw Key::C suppress ho jaata) — isliye
+                // dono check karo: terminal me Ctrl+C = interrupt, copy = button/Ctrl+Shift+C.
+                let cc = i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                    || (i.modifiers.ctrl && i.key_pressed(egui::Key::C));
                 (
-                    i.modifiers.ctrl && i.key_pressed(egui::Key::C),
+                    cc,
                     i.modifiers.ctrl && i.key_pressed(egui::Key::D),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::L),
                 )
@@ -1137,7 +1147,7 @@ impl Terminal {
 
     /// Command history (central, scrolls). Top-down, clean. stick_to_bottom se
     /// newest hamesha visible rehta jab content overflow ho.
-    fn render_history(&self, ui: &mut egui::Ui, font: &egui::FontId, theme: Theme) {
+    fn render_history(&mut self, ui: &mut egui::Ui, font: &egui::FontId, theme: Theme) {
         // alt-screen (vim/htop) → poora grid central me
         if self.screen.alt_active {
             render_alt(ui, font, &self.screen, theme);
@@ -1145,13 +1155,18 @@ impl Terminal {
         }
         let segs = self.segments();
         let last = segs.len().saturating_sub(1);
+        let avail = ui.available_height();
+        let mut content_h = 0.0f32;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                // bada top spacer + stick_to_bottom = content bottom pe chipakti
-                // (Warp jaisa: kam commands neeche, upar khaali). No flicker.
-                ui.add_space(ui.available_height());
+                // bottom-anchor: spacer = sirf utni jagah jitni content ke upar
+                // bachti hai (viewport − content). Pehle full-height spacer tha →
+                // content chhoti hone pe ek poora viewport khaali scroll hota tha.
+                let spacer = (avail - self.hist_h).max(0.0);
+                ui.add_space(spacer);
+                let top = ui.min_rect().bottom();
                 for (idx, seg) in segs.iter().enumerate() {
                     let (start, end, bidx) = *seg;
                     let boundary = bidx.map(|i| &self.screen.boundaries[i]);
@@ -1188,7 +1203,10 @@ impl Terminal {
                     }
                     ui.add_space(8.0);
                 }
+                // content (blocks) ki actual height — agle frame ke spacer ke liye.
+                content_h = (ui.min_rect().bottom() - top).max(0.0);
             });
+        self.hist_h = content_h;
     }
 
     /// Active boundary ka cwd (input chip ke liye).
